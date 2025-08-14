@@ -70,6 +70,7 @@ func ParseStream(isRFC3164Message bool, useRFC3164DefaultYear bool, useFallbackP
 
 var (
 	ciscoPattern = regexp.MustCompile(`^<(\d+)>:?\s*(.*)`)
+	rfc5424Pattern = regexp.MustCompile(`^<(\d+)>\s*(\d+)\s+(\S+)\s+(\S+)\s+(.*)`)
 	timestampPattern = regexp.MustCompile(`^(\w{3}\s+\d{1,2}\s+\d{2}:\d{2}:\d{2}\s+\w{3,4}):\s*(.*)`)
 	facilityPattern = regexp.MustCompile(`^(%[A-Z0-9_]+-\d+-[A-Z0-9_]+):\s*(.*)`)
 	hostnamePattern = regexp.MustCompile(`:\s*(\w+)\s+%[A-Z0-9_]+-\d+-[A-Z0-9_]+:`)
@@ -128,6 +129,47 @@ func parseFallbackMessage(line []byte) *FallbackMessage {
 	text := string(line)
 	originalText := text
 	
+	// Check if this is RFC5424 format with Cisco facility
+	if matches := rfc5424Pattern.FindStringSubmatch(text); len(matches) > 5 {
+		// Parse RFC5424: <pri> version timestamp hostname rest
+		if pri, err := strconv.Atoi(matches[1]); err == nil && pri >= 0 && pri <= 191 {
+			priority := uint8(pri)
+			facility := uint8(pri / 8)
+			severity := uint8(pri % 8)
+			msg.Priority = &priority
+			msg.Facility = &facility
+			msg.Severity = &severity
+			
+			// Parse ISO8601 timestamp
+			if t, err := time.Parse(time.RFC3339Nano, matches[3]); err == nil {
+				msg.Timestamp = &t
+			} else if t, err := time.Parse("2006-01-02T15:04:05.999Z", matches[3]); err == nil {
+				msg.Timestamp = &t
+			}
+			
+			// Set hostname
+			hostname := matches[4]
+			if hostname != "-" {
+				msg.Hostname = &hostname
+			}
+			
+			// Parse the rest for Cisco facility
+			text = matches[5]
+			if facilityMatches := facilityPattern.FindStringSubmatch(text); len(facilityMatches) > 2 {
+				msg.Appname = &facilityMatches[1]
+				message := facilityMatches[2]
+				msg.Message = &message
+			} else {
+				msg.Message = &text
+			}
+			
+			// Log if needed
+			log.Printf("FALLBACK_PARSE_SUCCESS: RFC5424 with Cisco facility parsed: %q", originalText)
+			return msg
+		}
+	}
+	
+	// Original Cisco format parsing
 	// Extract priority
 	priorityParsed := false
 	if matches := ciscoPattern.FindStringSubmatch(text); len(matches) > 2 {
