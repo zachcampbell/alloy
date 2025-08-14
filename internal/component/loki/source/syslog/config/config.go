@@ -56,6 +56,11 @@ type SyslogTargetConfig struct {
 	// When parsing an RFC3164 message, should the year be defaulted to the current year?
 	// When false, the year will default to 0.
 	RFC3164DefaultToCurrentYear bool `yaml:"rfc3164_default_to_current_year"`
+
+	// UseFallbackParser enables parsing of non-RFC compliant syslog messages
+	// (e.g., Cisco format). When enabled, messages that don't match RFC5424
+	// or RFC3164 will be parsed using a best-effort fallback parser.
+	UseFallbackParser bool `yaml:"use_fallback_parser"`
 }
 
 func (config SyslogTargetConfig) IsRFC3164Message() bool {

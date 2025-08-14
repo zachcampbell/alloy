@@ -24,6 +24,7 @@ type ListenerConfig struct {
 	MaxMessageLength            int                 `alloy:"max_message_length,attr,optional"`
 	TLSConfig                   config.TLSConfig    `alloy:"tls_config,block,optional"`
 	SyslogFormat                config.SysLogFormat `alloy:"syslog_format,attr,optional"`
+	UseFallbackParser           bool                `alloy:"use_fallback_parser,attr,optional"`
 }
 
 // DefaultListenerConfig provides the default arguments for a syslog listener.
@@ -77,6 +78,7 @@ func (sc ListenerConfig) Convert() (*scrapeconfig.SyslogTargetConfig, error) {
 		MaxMessageLength:            sc.MaxMessageLength,
 		TLSConfig:                   *sc.TLSConfig.Convert(),
 		SyslogFormat:                syslogFormat,
+		UseFallbackParser:           sc.UseFallbackParser,
 	}, nil
 }
 
