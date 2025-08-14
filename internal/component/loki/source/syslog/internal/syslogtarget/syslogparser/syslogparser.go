@@ -4,6 +4,7 @@ import (
 	"bufio"
 	"fmt"
 	"io"
+	"log"
 	"regexp"
 	"strconv"
 	"time"
@@ -70,7 +71,7 @@ func ParseStream(isRFC3164Message bool, useRFC3164DefaultYear bool, useFallbackP
 var (
 	ciscoPattern = regexp.MustCompile(`^<(\d+)>:?\s*(.*)`)
 	timestampPattern = regexp.MustCompile(`^(\w{3}\s+\d{1,2}\s+\d{2}:\d{2}:\d{2}\s+\w{3,4}):\s*(.*)`)
-	facilityPattern = regexp.MustCompile(`(%[A-Z0-9_]+-\d+-[A-Z0-9_]+):\s*(.*)`)
+	facilityPattern = regexp.MustCompile(`^(%[A-Z0-9_]+-\d+-[A-Z0-9_]+):\s*(.*)`)
 	hostnamePattern = regexp.MustCompile(`:\s*(\w+)\s+%[A-Z0-9_]+-\d+-[A-Z0-9_]+:`)
 	facilityNames = []string{
 		"kern", "user", "mail", "daemon", "auth", "syslog", "lpr", "news",
@@ -125,8 +126,10 @@ func (m *FallbackMessage) SeverityLevel() *string {
 func parseFallbackMessage(line []byte) *FallbackMessage {
 	msg := &FallbackMessage{}
 	text := string(line)
+	originalText := text
 	
 	// Extract priority
+	priorityParsed := false
 	if matches := ciscoPattern.FindStringSubmatch(text); len(matches) > 2 {
 		if pri, err := strconv.Atoi(matches[1]); err == nil && pri >= 0 && pri <= 191 {
 			priority := uint8(pri)
@@ -136,25 +139,30 @@ func parseFallbackMessage(line []byte) *FallbackMessage {
 			msg.Facility = &facility
 			msg.Severity = &severity
 			text = matches[2]
+			priorityParsed = true
 		}
 	}
 	
 	// Try to parse Cisco timestamp format: "Aug 13 22:08:06 UTC:"
+	timestampParsed := false
 	if matches := timestampPattern.FindStringSubmatch(text); len(matches) > 2 {
 		if t, err := time.Parse("Jan 02 15:04:05 MST", matches[1]); err == nil {
 			// Set year to current year since Cisco doesn't include it
 			now := time.Now()
 			t = t.AddDate(now.Year()-t.Year(), 0, 0)
 			msg.Timestamp = &t
+			timestampParsed = true
 		}
 		text = matches[2]
 	}
 	
 	// Try to parse Cisco facility: %FACILITY-SEVERITY-MNEMONIC:
+	facilityParsed := false
 	if matches := facilityPattern.FindStringSubmatch(text); len(matches) > 2 {
 		msg.Appname = &matches[1]
 		message := matches[2]
 		msg.Message = &message
+		facilityParsed = true
 	} else {
 		// No facility found, entire text is the message
 		msg.Message = &text
@@ -172,6 +180,12 @@ func parseFallbackMessage(line []byte) *FallbackMessage {
 	if msg.Timestamp == nil {
 		now := time.Now()
 		msg.Timestamp = &now
+	}
+	
+	// Log parsing failures for debugging
+	if !priorityParsed || !timestampParsed || !facilityParsed {
+		log.Printf("FALLBACK_PARSE_FAILURE: priority=%v timestamp=%v facility=%v message=%q", 
+			priorityParsed, timestampParsed, facilityParsed, originalText)
 	}
 	
 	return msg
