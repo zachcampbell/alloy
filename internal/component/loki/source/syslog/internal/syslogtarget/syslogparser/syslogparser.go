@@ -71,7 +71,7 @@ func ParseStream(isRFC3164Message bool, useRFC3164DefaultYear bool, useFallbackP
 var (
 	ciscoPattern = regexp.MustCompile(`^<(\d+)>:?\s*(.*)`)
 	rfc5424Pattern = regexp.MustCompile(`^<(\d+)>\s*(\d+)\s+(\S+)\s+(\S+)\s+(.*)`)
-	timestampPattern = regexp.MustCompile(`^(\w{3}\s+\d{1,2}\s+\d{2}:\d{2}:\d{2}\s+\w{3,4}):\s*(.*)`)
+	timestampPattern = regexp.MustCompile(`^\*?(\w{3}\s+\d{1,2}\s+\d{2}:\d{2}:\d{2})(?:\s+\w{3,4})?:\s*(.*)`)
 	facilityPattern = regexp.MustCompile(`^(%[A-Z0-9_]+-\d+-[A-Z0-9_]+):\s*(.*)`)
 	hostnamePattern = regexp.MustCompile(`:\s*(\w+)\s+%[A-Z0-9_]+-\d+-[A-Z0-9_]+:`)
 	facilityNames = []string{
@@ -185,11 +185,18 @@ func parseFallbackMessage(line []byte) *FallbackMessage {
 		}
 	}
 	
-	// Try to parse Cisco timestamp format: "Aug 13 22:08:06 UTC:"
+	// Try to parse Cisco timestamp format: "Aug 13 22:08:06" with optional timezone
 	timestampParsed := false
 	if matches := timestampPattern.FindStringSubmatch(text); len(matches) > 2 {
-		if t, err := time.Parse("Jan 02 15:04:05 MST", matches[1]); err == nil {
+		// Try parsing without timezone first (FS switches format)
+		if t, err := time.Parse("Jan 02 15:04:05", matches[1]); err == nil {
 			// Set year to current year since Cisco doesn't include it
+			now := time.Now()
+			t = t.AddDate(now.Year()-t.Year(), 0, 0)
+			msg.Timestamp = &t
+			timestampParsed = true
+		} else if t, err := time.Parse("Jan 02 15:04:05 MST", matches[1]); err == nil {
+			// Try with timezone for other formats
 			now := time.Now()
 			t = t.AddDate(now.Year()-t.Year(), 0, 0)
 			msg.Timestamp = &t
