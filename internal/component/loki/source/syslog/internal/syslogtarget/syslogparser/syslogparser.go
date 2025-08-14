@@ -6,7 +6,6 @@ import (
 	"io"
 	"regexp"
 	"strconv"
-	"strings"
 	"time"
 
 	"github.com/grafana/alloy/internal/util"
@@ -70,6 +69,9 @@ func ParseStream(isRFC3164Message bool, useRFC3164DefaultYear bool, useFallbackP
 
 var (
 	ciscoPattern = regexp.MustCompile(`^<(\d+)>:?\s*(.*)`)
+	timestampPattern = regexp.MustCompile(`^(\w{3}\s+\d{1,2}\s+\d{2}:\d{2}:\d{2}\s+\w{3,4}):\s*(.*)`)
+	facilityPattern = regexp.MustCompile(`(%[A-Z0-9_]+-\d+-[A-Z0-9_]+):\s*(.*)`)
+	hostnamePattern = regexp.MustCompile(`:\s*(\w+)\s+%[A-Z0-9_]+-\d+-[A-Z0-9_]+:`)
 	facilityNames = []string{
 		"kern", "user", "mail", "daemon", "auth", "syslog", "lpr", "news",
 		"uucp", "cron", "authpriv", "ftp", "ntp", "security", "console", "solaris-cron",
@@ -124,6 +126,7 @@ func parseFallbackMessage(line []byte) *FallbackMessage {
 	msg := &FallbackMessage{}
 	text := string(line)
 	
+	// Extract priority
 	if matches := ciscoPattern.FindStringSubmatch(text); len(matches) > 2 {
 		if pri, err := strconv.Atoi(matches[1]); err == nil && pri >= 0 && pri <= 191 {
 			priority := uint8(pri)
@@ -136,40 +139,40 @@ func parseFallbackMessage(line []byte) *FallbackMessage {
 		}
 	}
 	
-	parts := strings.Fields(text)
-	if len(parts) > 0 {
-		for i, part := range parts {
-			if strings.Contains(part, "%") && strings.Contains(part, "-") {
-				if i > 0 {
-					hostname := strings.TrimSuffix(parts[i-1], ":")
-					msg.Hostname = &hostname
-				}
-				
-				if strings.Contains(part, ":") {
-					appParts := strings.Split(part, ":")
-					if len(appParts) > 0 {
-						msg.Appname = &appParts[0]
-					}
-				} else {
-					msg.Appname = &part
-				}
-				
-				if i+1 < len(parts) {
-					message := strings.Join(parts[i+1:], " ")
-					msg.Message = &message
-				}
-				break
-			}
+	// Try to parse Cisco timestamp format: "Aug 13 22:08:06 UTC:"
+	if matches := timestampPattern.FindStringSubmatch(text); len(matches) > 2 {
+		if t, err := time.Parse("Jan 02 15:04:05 MST", matches[1]); err == nil {
+			// Set year to current year since Cisco doesn't include it
+			now := time.Now()
+			t = t.AddDate(now.Year()-t.Year(), 0, 0)
+			msg.Timestamp = &t
 		}
-		
-		if msg.Message == nil {
-			fullMessage := text
-			msg.Message = &fullMessage
+		text = matches[2]
+	}
+	
+	// Try to parse Cisco facility: %FACILITY-SEVERITY-MNEMONIC:
+	if matches := facilityPattern.FindStringSubmatch(text); len(matches) > 2 {
+		msg.Appname = &matches[1]
+		message := matches[2]
+		msg.Message = &message
+	} else {
+		// No facility found, entire text is the message
+		msg.Message = &text
+	}
+	
+	// Extract hostname if possible (look for hostname before facility code)
+	if msg.Appname != nil {
+		// Look for hostname pattern before the facility code in original text
+		if matches := hostnamePattern.FindStringSubmatch(string(line)); len(matches) > 1 {
+			msg.Hostname = &matches[1]
 		}
 	}
 	
-	now := time.Now()
-	msg.Timestamp = &now
+	// Use current time if no timestamp was parsed
+	if msg.Timestamp == nil {
+		now := time.Now()
+		msg.Timestamp = &now
+	}
 	
 	return msg
 }
