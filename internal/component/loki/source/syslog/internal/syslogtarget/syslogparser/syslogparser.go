@@ -22,6 +22,11 @@ import (
 // detects octet counting.
 // The function returns on EOF or unrecoverable errors.
 func ParseStream(isRFC3164Message bool, useRFC3164DefaultYear bool, useFallbackParser bool, r io.Reader, callback func(res *syslog.Result), maxMessageLength int) error {
+	return ParseStreamWithConfig(isRFC3164Message, useRFC3164DefaultYear, useFallbackParser, r, callback, maxMessageLength)
+}
+
+// ParseStreamWithConfig parses a syslog stream with optional custom parser configuration
+func ParseStreamWithConfig(isRFC3164Message bool, useRFC3164DefaultYear bool, useFallbackParser bool, r io.Reader, callback func(res *syslog.Result), maxMessageLength int) error {
 	buf := bufio.NewReaderSize(r, 1<<10)
 
 	b, err := buf.ReadByte()
@@ -74,6 +79,8 @@ var (
 	timestampPattern = regexp.MustCompile(`^\*?(\w{3}\s+\d{1,2}\s+\d{2}:\d{2}:\d{2})(?:\s+\w{3,4})?:\s*(.*)`)
 	facilityPattern = regexp.MustCompile(`^(%[A-Z0-9_]+-\d+-[A-Z0-9_]+):\s*(.*)`)
 	hostnamePattern = regexp.MustCompile(`:\s*(\w+)\s+%[A-Z0-9_]+-\d+-[A-Z0-9_]+:`)
+	fortinetPattern = regexp.MustCompile(`^(?:<(\d+)>)?date=(\d{4}-\d{2}-\d{2})\s+time=(\d{2}:\d{2}:\d{2})\s+devname="([^"]+)"\s+(.*)`)
+	juniperPattern = regexp.MustCompile(`^<(\d+)>(\w{3}\s+\d{1,2}\s+\d{2}:\d{2}:\d{2})\s+([^\s]+)\s+(.*)$`)
 	facilityNames = []string{
 		"kern", "user", "mail", "daemon", "auth", "syslog", "lpr", "news",
 		"uucp", "cron", "authpriv", "ftp", "ntp", "security", "console", "solaris-cron",
@@ -128,6 +135,104 @@ func parseFallbackMessage(line []byte) *FallbackMessage {
 	msg := &FallbackMessage{}
 	text := string(line)
 	originalText := text
+	
+	// Debug: log what we're trying to parse
+	if len(text) > 100 {
+		log.Printf("DEBUG: Parsing message: %q", text[:100]+"...")
+	} else {
+		log.Printf("DEBUG: Parsing message: %q", text)
+	}
+	
+	// Check if this is Fortinet format: <pri>date=YYYY-MM-DD time=HH:MM:SS devname="..." ...
+	if matches := fortinetPattern.FindStringSubmatch(text); len(matches) > 5 {
+		log.Printf("DEBUG: Fortinet pattern matched with %d groups", len(matches))
+		// Parse Fortinet format
+		priorityStr := matches[1] // optional <pri>
+		dateStr := matches[2]
+		timeStr := matches[3]
+		hostname := matches[4]
+		message := matches[5]
+		
+		// Parse priority if present
+		if priorityStr != "" {
+			if pri, err := strconv.Atoi(priorityStr); err == nil && pri >= 0 && pri <= 191 {
+				priority := uint8(pri)
+				facility := uint8(pri / 8)
+				severity := uint8(pri % 8)
+				msg.Priority = &priority
+				msg.Facility = &facility
+				msg.Severity = &severity
+			}
+		} else {
+			// Set default priority/facility/severity for Fortinet
+			priority := uint8(166) // local4.info (20*8 + 6)
+			facility := uint8(20)  // local4
+			severity := uint8(6)   // info
+			msg.Priority = &priority
+			msg.Facility = &facility
+			msg.Severity = &severity
+		}
+		
+		// Parse timestamp: combine date and time
+		timestampStr := dateStr + " " + timeStr
+		if t, err := time.Parse("2006-01-02 15:04:05", timestampStr); err == nil {
+			msg.Timestamp = &t
+		}
+		
+		// Set hostname from devname
+		msg.Hostname = &hostname
+		
+		// Set message
+		msg.Message = &message
+		
+		// Set appname to indicate Fortinet
+		appname := "fortigate"
+		msg.Appname = &appname
+		
+		log.Printf("FALLBACK_PARSE_SUCCESS: Fortinet format parsed: %q", originalText)
+		return msg
+	}
+	
+	// Check if this is Juniper format: <pri>Mon DD HH:MM:SS hostname message
+	if matches := juniperPattern.FindStringSubmatch(text); len(matches) > 4 {
+		log.Printf("DEBUG: Juniper pattern matched with %d groups", len(matches))
+		// Parse Juniper format
+		priorityStr := matches[1]
+		timestampStr := matches[2] 
+		hostname := matches[3]
+		message := matches[4]
+		
+		// Parse priority
+		if pri, err := strconv.Atoi(priorityStr); err == nil && pri >= 0 && pri <= 191 {
+			priority := uint8(pri)
+			facility := uint8(pri / 8)
+			severity := uint8(pri % 8)
+			msg.Priority = &priority
+			msg.Facility = &facility
+			msg.Severity = &severity
+		}
+		
+		// Parse BSD syslog timestamp: "Aug 19 22:03:05"
+		if t, err := time.Parse("Jan 02 15:04:05", timestampStr); err == nil {
+			// Set year to current year since BSD syslog doesn't include it
+			now := time.Now()
+			t = t.AddDate(now.Year()-t.Year(), 0, 0)
+			msg.Timestamp = &t
+		}
+		
+		// Set hostname 
+		msg.Hostname = &hostname
+		
+		// Set message
+		msg.Message = &message
+		
+		// Set appname to indicate Juniper
+		appname := "juniper"
+		msg.Appname = &appname
+		
+		log.Printf("FALLBACK_PARSE_SUCCESS: Juniper format parsed: %q", originalText)
+		return msg
+	}
 	
 	// Check if this is RFC5424 format with Cisco facility
 	if matches := rfc5424Pattern.FindStringSubmatch(text); len(matches) > 5 {

@@ -321,7 +321,7 @@ func (t *TCPTransport) handleConnection(cn net.Conn) {
 
 	lbs := t.connectionLabels(ipFromConn(c).String())
 
-	err := syslogparser.ParseStream(t.config.IsRFC3164Message(), t.config.RFC3164DefaultToCurrentYear, t.config.UseFallbackParser, c, func(result *syslog.Result) {
+	err := syslogparser.ParseStreamWithConfig(t.config.IsRFC3164Message(), t.config.RFC3164DefaultToCurrentYear, t.config.UseFallbackParser, c, func(result *syslog.Result) {
 		if err := result.Error; err != nil {
 			t.handleMessageError(err)
 			return
@@ -446,7 +446,7 @@ func (t *UDPTransport) handleRcv(c *ConnPipe) {
 
 		r := bytes.NewReader(datagram[:n])
 
-		err = syslogparser.ParseStream(t.config.IsRFC3164Message(), t.config.RFC3164DefaultToCurrentYear, t.config.UseFallbackParser, r, func(result *syslog.Result) {
+		err = syslogparser.ParseStreamWithConfig(t.config.IsRFC3164Message(), t.config.RFC3164DefaultToCurrentYear, t.config.UseFallbackParser, r, func(result *syslog.Result) {
 			if err := result.Error; err != nil {
 				t.handleMessageError(err)
 			} else {
