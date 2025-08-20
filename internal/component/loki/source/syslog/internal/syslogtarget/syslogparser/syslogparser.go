@@ -136,16 +136,8 @@ func parseFallbackMessage(line []byte) *FallbackMessage {
 	text := string(line)
 	originalText := text
 	
-	// Debug: log what we're trying to parse
-	if len(text) > 100 {
-		log.Printf("DEBUG: Parsing message: %q", text[:100]+"...")
-	} else {
-		log.Printf("DEBUG: Parsing message: %q", text)
-	}
-	
 	// Check if this is Fortinet format: <pri>date=YYYY-MM-DD time=HH:MM:SS devname="..." ...
 	if matches := fortinetPattern.FindStringSubmatch(text); len(matches) > 5 {
-		log.Printf("DEBUG: Fortinet pattern matched with %d groups", len(matches))
 		// Parse Fortinet format
 		priorityStr := matches[1] // optional <pri>
 		dateStr := matches[2]
@@ -189,13 +181,11 @@ func parseFallbackMessage(line []byte) *FallbackMessage {
 		appname := "fortigate"
 		msg.Appname = &appname
 		
-		log.Printf("FALLBACK_PARSE_SUCCESS: Fortinet format parsed: %q", originalText)
 		return msg
 	}
 	
 	// Check if this is Juniper format: <pri>Mon DD HH:MM:SS hostname message
 	if matches := juniperPattern.FindStringSubmatch(text); len(matches) > 4 {
-		log.Printf("DEBUG: Juniper pattern matched with %d groups", len(matches))
 		// Parse Juniper format
 		priorityStr := matches[1]
 		timestampStr := matches[2] 
@@ -230,7 +220,6 @@ func parseFallbackMessage(line []byte) *FallbackMessage {
 		appname := "juniper"
 		msg.Appname = &appname
 		
-		log.Printf("FALLBACK_PARSE_SUCCESS: Juniper format parsed: %q", originalText)
 		return msg
 	}
 	
@@ -269,7 +258,6 @@ func parseFallbackMessage(line []byte) *FallbackMessage {
 			}
 			
 			// Log if needed
-			log.Printf("FALLBACK_PARSE_SUCCESS: RFC5424 with Cisco facility parsed: %q", originalText)
 			return msg
 		}
 	}
@@ -336,10 +324,13 @@ func parseFallbackMessage(line []byte) *FallbackMessage {
 		msg.Timestamp = &now
 	}
 	
-	// Log parsing failures for debugging
-	if !priorityParsed || !timestampParsed || !facilityParsed {
-		log.Printf("FALLBACK_PARSE_FAILURE: priority=%v timestamp=%v facility=%v message=%q", 
-			priorityParsed, timestampParsed, facilityParsed, originalText)
+	// Log parsing failures for future improvements
+	hasPriority := msg.Priority != nil
+	hasTimestamp := timestampParsed
+	hasFacility := msg.Appname != nil
+	if !hasPriority || !hasTimestamp || !hasFacility {
+		log.Printf("Fallback parser incomplete: priority=%v timestamp=%v facility=%v message=%q",
+			hasPriority, hasTimestamp, hasFacility, originalText)
 	}
 	
 	return msg
