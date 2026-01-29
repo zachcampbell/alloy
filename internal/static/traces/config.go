@@ -24,7 +24,6 @@ import (
 	"github.com/open-telemetry/opentelemetry-collector-contrib/processor/tailsamplingprocessor"
 	"github.com/open-telemetry/opentelemetry-collector-contrib/receiver/jaegerreceiver"
 	"github.com/open-telemetry/opentelemetry-collector-contrib/receiver/kafkareceiver"
-	"github.com/open-telemetry/opentelemetry-collector-contrib/receiver/opencensusreceiver"
 	"github.com/open-telemetry/opentelemetry-collector-contrib/receiver/zipkinreceiver"
 	"github.com/prometheus/client_golang/prometheus"
 	prom_config "github.com/prometheus/common/config"
@@ -41,6 +40,7 @@ import (
 	"go.opentelemetry.io/collector/processor/batchprocessor"
 	"go.opentelemetry.io/collector/receiver"
 	"go.opentelemetry.io/collector/receiver/otlpreceiver"
+	"go.opentelemetry.io/collector/service/telemetry/otelconftelemetry"
 
 	promsdconsumer "github.com/grafana/alloy/internal/static/traces/promsdprocessor/consumer"
 
@@ -890,7 +890,6 @@ func tracingFactories() (otelcol.Factories, error) {
 		jaegerreceiver.NewFactory(),
 		zipkinreceiver.NewFactory(),
 		otlpreceiver.NewFactory(),
-		opencensusreceiver.NewFactory(),
 		kafkareceiver.NewFactory(),
 		noopreceiver.NewFactory(),
 		pushreceiver.NewFactory(),
@@ -928,6 +927,7 @@ func tracingFactories() (otelcol.Factories, error) {
 		Receivers:  receivers,
 		Processors: processors,
 		Exporters:  exporters,
+		Telemetry:  otelconftelemetry.NewFactory(),
 	}, nil
 }
 

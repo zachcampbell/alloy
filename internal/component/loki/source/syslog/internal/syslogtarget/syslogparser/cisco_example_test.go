@@ -35,9 +35,14 @@ func TestCiscoExamples(t *testing.T) {
 			}
 
 			reader := bytes.NewReader([]byte(tc.input))
-			
+
 			// Parse with fallback enabled
-			err := ParseStream(true, false, true, reader, callback, 8192)
+			err := ParseStream(StreamParseConfig{
+				IsRFC3164Message:      true,
+				UseRFC3164DefaultYear: false,
+				UseFallbackParser:     true,
+				MaxMessageLength:      8192,
+			}, reader, callback)
 			if err != nil {
 				t.Logf("Error: %v", err)
 			}

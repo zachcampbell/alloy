@@ -9,24 +9,93 @@ import (
 	"strconv"
 	"time"
 
-	"github.com/grafana/alloy/internal/util"
 	"github.com/leodido/go-syslog/v4"
 	"github.com/leodido/go-syslog/v4/nontransparent"
 	"github.com/leodido/go-syslog/v4/octetcounting"
 	"github.com/leodido/go-syslog/v4/rfc3164"
 	"github.com/leodido/go-syslog/v4/rfc5424"
+
+	"github.com/grafana/alloy/internal/util"
 )
+
+type framingType = uint
+
+const (
+	framingTypeUnknown framingType = iota
+	framingTypeOctetCounting
+	framingTypeNonTransparent
+)
+
+// framingTypeFromFirstByte detects framing type from a first byte of syslog line.
+// Returns [framingTypeUnknown] on failure.
+//
+// See https://datatracker.ietf.org/doc/html/rfc6587 for details on message framing.
+//
+// Note: this method doesn't support CEF logs as they don't have syslog priority prefix.
+func framingTypeFromFirstByte(b byte) framingType {
+	if b == '<' {
+		// Message starts with log severity and no length, should be consumed until '\n' or '\0' character.
+		return framingTypeNonTransparent
+	}
+
+	if isDigit(b) {
+		// Message starts with content length.
+		return framingTypeOctetCounting
+	}
+
+	return framingTypeUnknown
+}
+
+func isDigit(b byte) bool {
+	return b >= '0' && b <= '9'
+}
+
+type RFC3164CiscoComponents struct {
+	MessageCounter  bool
+	SequenceNumber  bool
+	CiscoHostname   bool
+	SecondFractions bool
+}
+
+type StreamParseConfig struct {
+	MaxMessageLength       int
+	IsRFC3164Message       bool
+	UseRFC3164DefaultYear  bool
+	RFC3164CiscoComponents *RFC3164CiscoComponents
+	UseFallbackParser      bool
+}
+
+func (cfg StreamParseConfig) ciscoComponentOptions() []syslog.MachineOption {
+	cmps := cfg.RFC3164CiscoComponents
+	if cmps == nil {
+		return nil
+	}
+
+	opts := make([]syslog.MachineOption, 0, 4) // max number of cisco components
+	if cmps.MessageCounter {
+		opts = append(opts, rfc3164.WithMessageCounter())
+	}
+
+	if cmps.SequenceNumber {
+		opts = append(opts, rfc3164.WithSequenceNumber())
+	}
+
+	if cmps.CiscoHostname {
+		opts = append(opts, rfc3164.WithCiscoHostname())
+	}
+
+	if cmps.SecondFractions {
+		opts = append(opts, rfc3164.WithSecondFractions())
+	}
+
+	return opts
+}
 
 // ParseStream parses a rfc5424 syslog stream from the given Reader, calling
 // the callback function with the parsed messages. The parser automatically
 // detects octet counting.
 // The function returns on EOF or unrecoverable errors.
-func ParseStream(isRFC3164Message bool, useRFC3164DefaultYear bool, useFallbackParser bool, r io.Reader, callback func(res *syslog.Result), maxMessageLength int) error {
-	return ParseStreamWithConfig(isRFC3164Message, useRFC3164DefaultYear, useFallbackParser, r, callback, maxMessageLength)
-}
-
-// ParseStreamWithConfig parses a syslog stream with optional custom parser configuration
-func ParseStreamWithConfig(isRFC3164Message bool, useRFC3164DefaultYear bool, useFallbackParser bool, r io.Reader, callback func(res *syslog.Result), maxMessageLength int) error {
+func ParseStream(cfg StreamParseConfig, r io.Reader, callback func(res *syslog.Result)) error {
 	buf := bufio.NewReaderSize(r, 1<<10)
 
 	b, err := buf.ReadByte()
@@ -35,7 +104,7 @@ func ParseStreamWithConfig(isRFC3164Message bool, useRFC3164DefaultYear bool, us
 	}
 	_ = buf.UnreadByte()
 	cb := callback
-	if isRFC3164Message && useRFC3164DefaultYear {
+	if cfg.IsRFC3164Message && cfg.UseRFC3164DefaultYear {
 		cb = func(res *syslog.Result) {
 			if res.Message != nil {
 				rfc3164Msg := res.Message.(*rfc3164.SyslogMessage)
@@ -47,29 +116,46 @@ func ParseStreamWithConfig(isRFC3164Message bool, useRFC3164DefaultYear bool, us
 		}
 	}
 
-	// Try standard parsers first, with fallback if enabled
-	if useFallbackParser {
-		// Use fallback parser for better compatibility
-		ParseFallbackStream(isRFC3164Message, buf, cb, maxMessageLength)
-	} else {
-		// Original strict parsing logic
-		if b == '<' {
-			if isRFC3164Message {
-				nontransparent.NewParserRFC3164(syslog.WithListener(cb), syslog.WithMaxMessageLength(maxMessageLength), syslog.WithBestEffort()).Parse(buf)
-			} else {
-				nontransparent.NewParser(syslog.WithListener(cb), syslog.WithMaxMessageLength(maxMessageLength), syslog.WithBestEffort()).Parse(buf)
-			}
-		} else if b >= '0' && b <= '9' {
-			if isRFC3164Message {
-				octetcounting.NewParserRFC3164(syslog.WithListener(cb), syslog.WithMaxMessageLength(maxMessageLength), syslog.WithBestEffort()).Parse(buf)
-			} else {
-				octetcounting.NewParser(syslog.WithListener(cb), syslog.WithMaxMessageLength(maxMessageLength), syslog.WithBestEffort()).Parse(buf)
-			}
-		} else {
-			return fmt.Errorf("invalid or unsupported framing. first byte: '%s'", string(b))
-		}
+	// Use fallback parser for Fortinet/Juniper/other non-standard formats
+	if cfg.UseFallbackParser {
+		ParseFallbackStream(cfg.IsRFC3164Message, buf, cb, cfg.MaxMessageLength)
+		return nil
 	}
 
+	opts := []syslog.ParserOption{
+		syslog.WithListener(cb),
+		syslog.WithMaxMessageLength(cfg.MaxMessageLength),
+		syslog.WithBestEffort(),
+	}
+
+	if cfg.IsRFC3164Message && cfg.RFC3164CiscoComponents != nil {
+		machineOpts := cfg.ciscoComponentOptions()
+		opts = append(opts, syslog.WithMachineOptions(machineOpts...))
+	}
+
+	// See https://datatracker.ietf.org/doc/html/rfc6587 for details on message framing
+	// If a syslog message starts with '<' the first piece of the message is the priority, which means it must use
+	// an explicit framing character.
+	var parserFunc func(args ...syslog.ParserOption) syslog.Parser
+	switch framingTypeFromFirstByte(b) {
+	case framingTypeNonTransparent:
+		if cfg.IsRFC3164Message {
+			parserFunc = nontransparent.NewParserRFC3164
+		} else {
+			parserFunc = nontransparent.NewParser
+		}
+	case framingTypeOctetCounting:
+		// If a syslog message starts with a digit, it must use octet counting, and the first piece of the message is the length
+		if cfg.IsRFC3164Message {
+			parserFunc = octetcounting.NewParserRFC3164
+		} else {
+			parserFunc = octetcounting.NewParser
+		}
+	default:
+		return fmt.Errorf("invalid or unsupported framing. first byte: %q", b)
+	}
+
+	parserFunc(opts...).Parse(buf)
 	return nil
 }
 

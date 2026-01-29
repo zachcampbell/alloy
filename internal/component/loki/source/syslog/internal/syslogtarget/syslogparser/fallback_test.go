@@ -179,7 +179,12 @@ func TestParseStreamWithFallback(t *testing.T) {
 			}
 
 			reader := bytes.NewReader([]byte(tc.input))
-			err := ParseStream(true, false, tc.useFallback, reader, callback, 8192)
+			err := ParseStream(StreamParseConfig{
+				IsRFC3164Message:      true,
+				UseRFC3164DefaultYear: false,
+				UseFallbackParser:     tc.useFallback,
+				MaxMessageLength:      8192,
+			}, reader, callback)
 
 			if tc.expectError && err == nil {
 				t.Error("Expected error but got none")

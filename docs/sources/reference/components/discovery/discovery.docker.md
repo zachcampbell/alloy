@@ -103,7 +103,7 @@ You can specify the `filter` block multiple times to provide more than one filte
 
 Refer to [List containers][List containers] from the Docker Engine API documentation for the list of supported filters and their meaning.
 
-[List containers]: https://docs.docker.com/engine/api/v1.41/#tag/Container/operation/ContainerList
+[List containers]: https://docs.docker.com/reference/api/engine/latest/#tag/Container/operation/ContainerList
 
 ### `oauth2`
 
@@ -143,6 +143,12 @@ Each target includes the following labels:
 * `__meta_docker_port_public`: The publicly exposed port from the container, if a port mapping exists.
 
 Each discovered container maps to one target per unique combination of networks and port mappings used by the container.
+
+{{< admonition type="note" >}}
+{{< param "PRODUCT_NAME" >}} sanitizes Docker label names in `__meta_docker_container_label_<labelname>` and `__meta_docker_network_label_<labelname>` to comply with Prometheus label naming requirements.
+The component converts dots and other non-alphanumeric characters to underscores. Underscores remain unchanged.
+For example, a Docker label `com.example.app.name` becomes `__meta_docker_container_label_com_example_app_name`.
+{{< /admonition >}}
 
 ## Component health
 

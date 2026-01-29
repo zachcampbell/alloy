@@ -12,16 +12,18 @@ import (
 	"testing"
 	"time"
 
+	debuginfogrpc "buf.build/gen/go/parca-dev/parca/grpc/go/parca/debuginfo/v1alpha1/debuginfov1alpha1grpc"
 	"connectrpc.com/connect"
+	"go.opentelemetry.io/otel/trace/noop"
 
 	"github.com/phayes/freeport"
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/prometheus/model/labels"
 	"github.com/stretchr/testify/require"
 
-	"github.com/grafana/alloy/internal/component"
 	fnet "github.com/grafana/alloy/internal/component/common/net"
 	"github.com/grafana/alloy/internal/component/pyroscope"
+	"github.com/grafana/alloy/internal/component/pyroscope/write/debuginfo"
 	"github.com/grafana/alloy/internal/util"
 	pushv1 "github.com/grafana/pyroscope/api/gen/proto/go/push/v1"
 	"github.com/grafana/pyroscope/api/gen/proto/go/push/v1/pushv1connect"
@@ -295,6 +297,7 @@ func TestForwardsProfilesPushV1(t *testing.T) {
 				var samples []*pushv1.RawSample
 				for j := 0; j < tc.numSamplesPerSeries; j++ {
 					samples = append(samples, &pushv1.RawSample{
+						ID:         fmt.Sprintf("request-id-%d-%d", i, j),
 						RawProfile: bytes.Repeat([]byte{0xde, 0xad}, tc.SampleSize/2),
 					})
 				}
@@ -326,9 +329,12 @@ func TestForwardsProfilesPushV1(t *testing.T) {
 				require.Equal(t, tc.numSeries*tc.numSamplesPerSeries, a.samples())
 
 				// check samples are received in full
-				for _, samples := range a.pushedSamples {
-					for _, sample := range samples {
+				for seriesIdx, samples := range a.pushedSamples {
+					for sampleIdx, sample := range samples {
 						require.Len(t, sample.RawProfile, tc.SampleSize)
+						// Verify that ID field is propagated correctly
+						expectedID := fmt.Sprintf("request-id-%d-%d", seriesIdx, sampleIdx)
+						require.Equal(t, expectedID, sample.ID, "ID field should be correctly propagated to sample")
 					}
 				}
 			}
@@ -421,7 +427,12 @@ func startComponent(t *testing.T, appendables []pyroscope.Appendable) int {
 		ForwardTo: appendables,
 	}
 
-	comp, err := New(testOptions(t), args)
+	comp, err := New(
+		util.TestAlloyLogger(t),
+		noop.Tracer{},
+		prometheus.NewRegistry(),
+		args,
+	)
 	require.NoError(t, err)
 
 	ctx, cancel := context.WithCancel(t.Context())
@@ -536,12 +547,12 @@ func (a *testAppender) AppendIngest(_ context.Context, profile *pyroscope.Incomi
 	return a.appendErr
 }
 
-func testOptions(t *testing.T) component.Options {
-	return component.Options{
-		ID:         "pyroscope.receive_http.test",
-		Logger:     util.TestAlloyLogger(t),
-		Registerer: prometheus.NewRegistry(),
-	}
+func (a *testAppender) Client() debuginfogrpc.DebuginfoServiceClient {
+	return nil
+}
+
+func (a *testAppender) Upload(_ debuginfo.UploadJob) {
+	// no-op for tests
 }
 
 // TestUpdateArgs verifies that the component can be updated with new arguments. This explicitly also makes sure that the server is restarted when the server configuration changes. And there are no metric registration conflicts.
@@ -561,7 +572,12 @@ func TestUpdateArgs(t *testing.T) {
 		ForwardTo: forwardTo,
 	}
 
-	comp, err := New(testOptions(t), args)
+	comp, err := New(
+		util.TestAlloyLogger(t),
+		noop.Tracer{},
+		prometheus.NewRegistry(),
+		args,
+	)
 	require.NoError(t, err)
 
 	ctx, cancel := context.WithCancel(t.Context())
@@ -596,4 +612,81 @@ func TestUpdateArgs(t *testing.T) {
 	})
 	require.NoError(t, err)
 	require.False(t, shutdown)
+}
+
+// TestAPIToAlloySamples verifies that the ID field is properly propagated
+// from API samples to Alloy samples during conversion.
+func TestAPIToAlloySamples(t *testing.T) {
+	tests := []struct {
+		name     string
+		input    []*pushv1.RawSample
+		expected []*pyroscope.RawSample
+	}{
+		{
+			name: "single sample with ID",
+			input: []*pushv1.RawSample{
+				{
+					ID:         "test-id-123",
+					RawProfile: []byte("profile-data-1"),
+				},
+			},
+			expected: []*pyroscope.RawSample{
+				{
+					ID:         "test-id-123",
+					RawProfile: []byte("profile-data-1"),
+				},
+			},
+		},
+		{
+			name: "multiple samples with different IDs",
+			input: []*pushv1.RawSample{
+				{
+					ID:         "request-id-1",
+					RawProfile: []byte("profile-1"),
+				},
+				{
+					ID:         "request-id-2",
+					RawProfile: []byte("profile-2"),
+				},
+			},
+			expected: []*pyroscope.RawSample{
+				{
+					ID:         "request-id-1",
+					RawProfile: []byte("profile-1"),
+				},
+				{
+					ID:         "request-id-2",
+					RawProfile: []byte("profile-2"),
+				},
+			},
+		},
+		{
+			name: "sample with empty ID",
+			input: []*pushv1.RawSample{
+				{
+					ID:         "",
+					RawProfile: []byte("profile-data"),
+				},
+			},
+			expected: []*pyroscope.RawSample{
+				{
+					ID:         "",
+					RawProfile: []byte("profile-data"),
+				},
+			},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			result := apiToAlloySamples(tt.input)
+
+			require.Len(t, result, len(tt.expected), "Unexpected number of samples")
+
+			for i, expected := range tt.expected {
+				require.Equal(t, expected.ID, result[i].ID, "ID mismatch at index %d", i)
+				require.Equal(t, expected.RawProfile, result[i].RawProfile, "RawProfile mismatch at index %d", i)
+			}
+		})
+	}
 }

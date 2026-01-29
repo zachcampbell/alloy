@@ -25,12 +25,12 @@ import (
 	"k8s.io/apimachinery/pkg/labels"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/client-go/kubernetes"
-	"k8s.io/client-go/rest"
 	toolscache "k8s.io/client-go/tools/cache"
 	"sigs.k8s.io/controller-runtime/pkg/cache"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 
 	"github.com/grafana/alloy/internal/component"
+	commonk8s "github.com/grafana/alloy/internal/component/common/kubernetes"
 	"github.com/grafana/alloy/internal/component/prometheus"
 	"github.com/grafana/alloy/internal/component/prometheus/operator"
 	"github.com/grafana/alloy/internal/component/prometheus/operator/configgen"
@@ -60,6 +60,42 @@ func (realCrdManagerFactory) New(opts component.Options, cluster cluster.Cluster
 	return newCrdManager(opts, cluster, logger, args, kind, ls)
 }
 
+// CacheFactory creates controller-runtime caches with the given options.
+// This is returned by K8sFactory.New and can be called multiple times (e.g., once per namespace).
+type CacheFactory func(opts cache.Options) (cache.Cache, error)
+
+// K8sFactory creates Kubernetes clients and cache factories.
+// This allows tests to inject fake implementations while production code uses real ones.
+type K8sFactory interface {
+	// New creates a Kubernetes client and a cache factory.
+	// The cache factory can be called multiple times to create caches with different options.
+	New(clientConfig commonk8s.ClientArguments, logger log.Logger) (kubernetes.Interface, CacheFactory, error)
+}
+
+// realK8sFactory is the production implementation that creates real Kubernetes clients and caches.
+type realK8sFactory struct{}
+
+func (realK8sFactory) New(clientConfig commonk8s.ClientArguments, logger log.Logger) (kubernetes.Interface, CacheFactory, error) {
+	restConfig, err := clientConfig.BuildRESTConfig(logger)
+	if err != nil {
+		return nil, nil, fmt.Errorf("creating rest config: %w", err)
+	}
+
+	k8sClient, err := kubernetes.NewForConfig(restConfig)
+	if err != nil {
+		return nil, nil, fmt.Errorf("creating kubernetes client: %w", err)
+	}
+
+	cacheFactory := func(opts cache.Options) (cache.Cache, error) {
+		return cache.New(restConfig, opts)
+	}
+
+	return k8sClient, cacheFactory, nil
+}
+
+// defaultK8sFactory is the production K8sFactory used when none is injected.
+var defaultK8sFactory K8sFactory = realK8sFactory{}
+
 // crdManager is all of the fields required to run a crd based component.
 // on update, this entire thing should be recreated and restarted
 type crdManager struct {
@@ -84,7 +120,8 @@ type crdManager struct {
 	args    *operator.Arguments
 	cluster cluster.Cluster
 
-	client *kubernetes.Clientset
+	client     kubernetes.Interface
+	k8sFactory K8sFactory
 
 	kind string
 }
@@ -114,17 +151,17 @@ func newCrdManager(opts component.Options, cluster cluster.Cluster, logger log.L
 		kind:              kind,
 		clusteringUpdated: make(chan struct{}, 1),
 		ls:                ls,
+		k8sFactory:        defaultK8sFactory,
 	}
 }
 
 func (c *crdManager) Run(ctx context.Context) error {
-	restConfig, err := c.args.Client.BuildRESTConfig(c.logger)
+	// Create Kubernetes client and cache factory
+	var err error
+	var cacheFactory CacheFactory
+	c.client, cacheFactory, err = c.k8sFactory.New(c.args.Client, c.logger)
 	if err != nil {
-		return fmt.Errorf("creating rest config: %w", err)
-	}
-	c.client, err = kubernetes.NewForConfig(restConfig)
-	if err != nil {
-		return fmt.Errorf("creating kubernetes client: %w", err)
+		return fmt.Errorf("creating kubernetes client and cache factory: %w", err)
 	}
 
 	unregisterer := util.WrapWithUnregisterer(c.opts.Registerer)
@@ -146,8 +183,14 @@ func (c *crdManager) Run(ctx context.Context) error {
 
 	// Start prometheus scrape manager.
 	alloyAppendable := prometheus.NewFanout(c.args.ForwardTo, c.opts.ID, c.opts.Registerer, c.ls)
-	opts := &scrape.Options{}
-	c.scrapeManager, err = scrape.NewManager(opts, slog.New(logging.NewSlogGoKitHandler(c.logger)), nil, alloyAppendable, unregisterer)
+
+	// TODO: Expose EnableCreatedTimestampZeroIngestion: https://github.com/grafana/alloy/issues/4045
+	// TODO: Expose EnableTypeAndUnitLabels: https://github.com/grafana/alloy/issues/4659
+	scrapeOpts := &scrape.Options{
+		AppendMetadata:        c.args.Scrape.HonorMetadata,
+		PassMetadataInContext: c.args.Scrape.HonorMetadata,
+	}
+	c.scrapeManager, err = scrape.NewManager(scrapeOpts, slog.New(logging.NewSlogGoKitHandler(c.logger)), nil, alloyAppendable, unregisterer)
 	if err != nil {
 		return fmt.Errorf("creating scrape manager: %w", err)
 	}
@@ -162,7 +205,7 @@ func (c *crdManager) Run(ctx context.Context) error {
 	}()
 
 	// run informers after everything else is running
-	if err := c.runInformers(restConfig, ctx); err != nil {
+	if err := c.runInformers(cacheFactory, ctx); err != nil {
 		return err
 	}
 	level.Info(c.logger).Log("msg", "informers started")
@@ -273,7 +316,7 @@ func (c *crdManager) GetScrapeConfig(ns, name string) []*config.ScrapeConfig {
 }
 
 // runInformers starts all the informers that are required to discover CRDs.
-func (c *crdManager) runInformers(restConfig *rest.Config, ctx context.Context) error {
+func (c *crdManager) runInformers(cacheFactory CacheFactory, ctx context.Context) error {
 	scheme := runtime.NewScheme()
 	for _, add := range []func(*runtime.Scheme) error{
 		promopv1.AddToScheme,
@@ -301,12 +344,12 @@ func (c *crdManager) runInformers(restConfig *rest.Config, ctx context.Context) 
 		if ls != labels.Nothing() {
 			opts.DefaultLabelSelector = ls
 		}
-		cache, err := cache.New(restConfig, opts)
+		informerCache, err := cacheFactory(opts)
 		if err != nil {
 			return err
 		}
 
-		informers := cache
+		informers := informerCache
 
 		go func() {
 			err := informers.Start(ctx)
@@ -364,21 +407,26 @@ func (c *crdManager) configureInformers(ctx context.Context, informers cache.Inf
 	var informer cache.Informer
 	var err error
 
+	timeoutCtx, cancel := context.WithTimeout(ctx, c.args.InformerSyncTimeout)
+	deadline, _ := timeoutCtx.Deadline()
+	defer cancel()
 	backoff := backoff.New(
-		ctx,
+		timeoutCtx,
 		backoff.Config{
 			MinBackoff: 1 * time.Second,
 			MaxBackoff: 10 * time.Second,
-			MaxRetries: 3, // retry up to 3 times
+			MaxRetries: 0, // Will retry until InformerSyncTimeout is reached
 		},
 	)
-	for backoff.Ongoing() {
+	for {
 		// Retry to get the informer in case of a timeout.
 		informer, err = getInformer(ctx, informers, prototype, c.args.InformerSyncTimeout)
-		if err == nil {
+		nextDelay := backoff.NextDelay()
+		// exit loop on success, timeout, max retries reached, or if next backoff exceeds timeout
+		if err == nil || !backoff.Ongoing() || time.Now().Add(nextDelay).After(deadline) {
 			break
 		}
-		level.Warn(c.logger).Log("msg", "failed to get informer, retrying", "next backoff", backoff.NextDelay(), "err", err)
+		level.Warn(c.logger).Log("msg", "failed to get informer, retrying", "next backoff", nextDelay, "err", err)
 		backoff.Wait()
 	}
 	if err != nil {
@@ -434,9 +482,14 @@ func (c *crdManager) apply() error {
 	for _, sc := range c.scrapeConfigs {
 		scs = append(scs, sc)
 	}
-	err = c.scrapeManager.ApplyConfig(&config.Config{
-		ScrapeConfigs: scs,
-	})
+
+	cfg, err := config.Load("", slog.New(logging.NewSlogGoKitHandler(c.logger)))
+	if err != nil {
+		return fmt.Errorf("loading empty config: %w", err)
+	}
+	cfg.ScrapeConfigs = scs
+
+	err = c.scrapeManager.ApplyConfig(cfg)
 	if err != nil {
 		level.Error(c.logger).Log("msg", "error applying scrape configs", "err", err)
 		return err

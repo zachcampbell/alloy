@@ -2,6 +2,7 @@ package vm_test
 
 import (
 	"fmt"
+	"path/filepath"
 	"reflect"
 	"testing"
 
@@ -42,6 +43,8 @@ func TestVM_Stdlib(t *testing.T) {
 		{"encoding.from_URLbase64", `encoding.from_URLbase64("c3RyaW5nMTIzIT8kKiYoKSctPUB-")`, string(`string123!?$*&()'-=@~`)},
 		{"encoding.to_base64", `encoding.to_base64("string123!?$*&()'-=@~")`, string(`c3RyaW5nMTIzIT8kKiYoKSctPUB+`)},
 		{"encoding.to_URLbase64", `encoding.to_URLbase64("string123!?$*&()'-=@~")`, string(`c3RyaW5nMTIzIT8kKiYoKSctPUB-`)},
+		{"encoding.url_encode", `encoding.url_encode("string123!?$*&()'-=@~")`, string(`string123%21%3F%24%2A%26%28%29%27-%3D%40~`)},
+		{"encoding.url_decode", `encoding.url_decode("string123%21%3F%24%2A%26%28%29%27-%3D%40~")`, string(`string123!?$*&()'-=@~`)},
 		{
 			"encoding.to_json object",
 			`encoding.to_json({"modules"={"http_2xx"={"prober"="http","timeout"="5s","http"={"headers"={"Authorization"=sys.env("TEST_VAR")}}}}})`,
@@ -83,6 +86,18 @@ func TestVM_Stdlib(t *testing.T) {
 			"array.combine_maps",
 			`array.combine_maps([{"a" = 1, "b" = 2.2}], [{"a" = 2, "b" = "3.3"}], ["a"])`,
 			[]map[string]interface{}{},
+		},
+		{
+			// Not enough matches for a join, but all elements from the first array are passed through.
+			"array.combine_maps",
+			`array.combine_maps([{"a" = 1, "b" = 4.2, "c" = 5}, {"d" = "asdf"}], [{"a" = 2, "b" = "5.3"}], ["a"], true)`,
+			[]map[string]interface{}{{"a": 1, "b": 4.2, "c": 5}, {"d": "asdf"}},
+		},
+		{
+			// Only one element from the first array matches, but all elements from the first array are passed through.
+			"array.combine_maps",
+			`array.combine_maps([{"a" = 1, "b" = 4.2, "c" = 5}, {"d" = "asdf"}, {"a" = 2, "b" = "1", "z" = "z1"}], [{"a" = 2, "b" = "5.3"}], ["a"], true)`,
+			[]map[string]interface{}{{"a": 1, "b": 4.2, "c": 5}, {"d": "asdf"}, {"a": 2, "z": "z1", "b": "5.3"}},
 		},
 		{
 			// Not enough matches for a join.
@@ -371,7 +386,7 @@ func TestStdlibFileFunc(t *testing.T) {
 		input  string
 		expect interface{}
 	}{
-		{"file.path_join", `file.path_join("this/is", "a/path")`, "this/is/a/path"},
+		{"file.path_join", `file.path_join("this/is", "a/path")`, filepath.Join("this", "is", "a", "path")},
 		{"file.path_join empty", `file.path_join()`, ""},
 	}
 
