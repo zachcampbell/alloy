@@ -1,6 +1,7 @@
 package syslogparser_test
 
 import (
+	"fmt"
 	"io"
 	"strings"
 	"testing"
@@ -118,7 +119,10 @@ func TestParseStream_RFC3164Timestamp(t *testing.T) {
 }
 
 func TestParseStream_RFC3164TimestampWithYear(t *testing.T) {
-	r := strings.NewReader("<13>Dec  1 00:00:00 host Message")
+	// Use current month to avoid year-boundary issues (December timestamps in January are assigned to previous year)
+	now := time.Now()
+	monthStr := now.Format("Jan")
+	r := strings.NewReader(fmt.Sprintf("<13>%s  1 00:00:00 host Message", monthStr))
 
 	results := make([]*syslog.Result, 0)
 	cb := func(res *syslog.Result) {
@@ -132,5 +136,5 @@ func TestParseStream_RFC3164TimestampWithYear(t *testing.T) {
 	require.NoError(t, results[0].Error)
 	require.Equal(t, "Message", *results[0].Message.(*rfc3164.SyslogMessage).Message)
 	require.Equal(t, "host", *results[0].Message.(*rfc3164.SyslogMessage).Hostname)
-	require.Equal(t, time.Date(time.Now().Year(), 12, 1, 0, 0, 0, 0, time.UTC), *results[0].Message.(*rfc3164.SyslogMessage).Timestamp)
+	require.Equal(t, time.Date(now.Year(), now.Month(), 1, 0, 0, 0, 0, time.UTC), *results[0].Message.(*rfc3164.SyslogMessage).Timestamp)
 }

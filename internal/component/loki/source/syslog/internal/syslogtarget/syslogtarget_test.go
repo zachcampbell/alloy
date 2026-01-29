@@ -984,7 +984,224 @@ func TestParseStream_WithAsyncPipe(t *testing.T) {
 		results = append(results, res)
 	}
 
-	err := syslogparser.ParseStream(false, false, pipe, cb, DefaultMaxMessageLength)
+	err := syslogparser.ParseStream(false, false, false, pipe, cb, DefaultMaxMessageLength)
 	require.NoError(t, err)
 	require.Equal(t, 3, len(results))
+}
+
+func TestIsLikelyBadHostname(t *testing.T) {
+	tests := []struct {
+		hostname string
+		isBad    bool
+	}{
+		// Bad hostnames - paths
+		{"/usr/sbin/cron[78976]:", true},
+		{"/bin/bash", true},
+		{"/var/log/messages", true},
+
+		// Bad hostnames - process[pid] patterns
+		{"sshd[78988]:", true},
+		{"mgd[80201]:", true},
+		{"inetd[871]:", true},
+		{"cron[12345]", true},
+		{"app[1]:", true},
+
+		// Bad hostnames - timezone fragments
+		{"EST:", true},
+		{"UTC:", true},
+		{"PST:", true},
+		{"CEST:", true},
+
+		// Valid hostnames - should NOT be flagged
+		{"myserver", false},
+		{"host.example.com", false},
+		{"192.168.1.1", false},
+		{"web-server-01", false},
+		{"localhost", false},
+		{"app", false},                 // No [pid] suffix
+		{"sshd", false},                // No [pid] suffix
+		{"EST", false},                 // No colon suffix
+		{"my-app[version]", false},     // Not numeric in brackets
+		{"server123", false},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.hostname, func(t *testing.T) {
+			result := isLikelyBadHostname(tt.hostname)
+			require.Equal(t, tt.isBad, result, "hostname: %q", tt.hostname)
+		})
+	}
+}
+
+func TestSyslogTarget_HostnameFallbackToIP(t *testing.T) {
+	w := log.NewSyncWriter(os.Stderr)
+	logger := log.NewLogfmtLogger(w)
+	client := fake.NewClient(func() {})
+
+	metrics := NewMetrics(nil)
+
+	// Create relabel config that copies __syslog_message_hostname to hostname label
+	relabelCfg := `
+- source_labels: ['__syslog_message_hostname']
+  target_label: 'hostname'
+- source_labels: ['__syslog_message_severity']
+  target_label: 'severity'
+`
+	var relabels []*relabel.Config
+	err := yaml.Unmarshal([]byte(relabelCfg), &relabels)
+	require.NoError(t, err)
+
+	tgt, err := NewSyslogTarget(metrics, logger, client, relabels, &scrapeconfig.SyslogTargetConfig{
+		ListenAddress:        "127.0.0.1:0",
+		HostnameFallbackToIP: true,
+		Labels: model.LabelSet{
+			"test": "hostname_fallback",
+		},
+	})
+	require.NoError(t, err)
+	defer func() {
+		require.NoError(t, tgt.Stop())
+	}()
+
+	require.Eventually(t, tgt.Ready, time.Second, 10*time.Millisecond)
+
+	addr := tgt.ListenAddress().String()
+	c, err := net.Dial("tcp", addr)
+	require.NoError(t, err)
+
+	// Messages with bad hostnames that should trigger fallback
+	messages := []string{
+		// hostname = "sshd[78988]:" which should be replaced with connection IP
+		`<165>1 2018-10-11T22:14:15.003Z sshd[78988]: e - id1 - Message from device with bad hostname`,
+		// hostname = "/usr/sbin/cron[123]:" which should be replaced with connection IP
+		`<165>1 2018-10-11T22:14:15.005Z /usr/sbin/cron[123]: e - id2 - Another message with path hostname`,
+		// hostname = "EST:" which should be replaced with connection IP
+		`<165>1 2018-10-11T22:14:15.007Z EST: e - id3 - Timezone fragment as hostname`,
+		// Valid hostname - should NOT be replaced
+		`<165>1 2018-10-11T22:14:15.009Z validhost e - id4 - Message with valid hostname`,
+	}
+
+	err = writeMessagesToStream(c, messages, fmtOctetCounting)
+	require.NoError(t, err)
+	require.NoError(t, c.Close())
+
+	require.Eventuallyf(t, func() bool {
+		return len(client.Received()) == len(messages)
+	}, time.Second, 10*time.Millisecond, "Expected to receive %d messages, got %d.", len(messages), len(client.Received()))
+
+	// Check that bad hostnames were replaced with connection IP (127.0.0.1)
+	for i, entry := range client.Received() {
+		hostname := string(entry.Labels["hostname"])
+		if i < 3 {
+			// First 3 messages have bad hostnames, should be replaced with IP
+			require.Equal(t, "127.0.0.1", hostname, "Message %d: bad hostname should be replaced with connection IP", i)
+		} else {
+			// Last message has valid hostname, should be preserved
+			require.Equal(t, "validhost", hostname, "Message %d: valid hostname should be preserved", i)
+		}
+	}
+}
+
+func TestSyslogTarget_HostnameFallbackDisabled(t *testing.T) {
+	w := log.NewSyncWriter(os.Stderr)
+	logger := log.NewLogfmtLogger(w)
+	client := fake.NewClient(func() {})
+
+	metrics := NewMetrics(nil)
+
+	// Create relabel config that copies __syslog_message_hostname to hostname label
+	relabelCfg := `
+- source_labels: ['__syslog_message_hostname']
+  target_label: 'hostname'
+`
+	var relabels []*relabel.Config
+	err := yaml.Unmarshal([]byte(relabelCfg), &relabels)
+	require.NoError(t, err)
+
+	// HostnameFallbackToIP is NOT set (defaults to false)
+	tgt, err := NewSyslogTarget(metrics, logger, client, relabels, &scrapeconfig.SyslogTargetConfig{
+		ListenAddress: "127.0.0.1:0",
+		Labels: model.LabelSet{
+			"test": "hostname_fallback_disabled",
+		},
+	})
+	require.NoError(t, err)
+	defer func() {
+		require.NoError(t, tgt.Stop())
+	}()
+
+	require.Eventually(t, tgt.Ready, time.Second, 10*time.Millisecond)
+
+	addr := tgt.ListenAddress().String()
+	c, err := net.Dial("tcp", addr)
+	require.NoError(t, err)
+
+	// Message with bad hostname - should NOT be replaced when fallback is disabled
+	messages := []string{
+		`<165>1 2018-10-11T22:14:15.003Z sshd[78988]: e - id1 - Message from device with bad hostname`,
+	}
+
+	err = writeMessagesToStream(c, messages, fmtOctetCounting)
+	require.NoError(t, err)
+	require.NoError(t, c.Close())
+
+	require.Eventuallyf(t, func() bool {
+		return len(client.Received()) == len(messages)
+	}, time.Second, 10*time.Millisecond, "Expected to receive %d messages, got %d.", len(messages), len(client.Received()))
+
+	// Check that bad hostname was NOT replaced (fallback disabled)
+	hostname := string(client.Received()[0].Labels["hostname"])
+	require.Equal(t, "sshd[78988]:", hostname, "hostname should NOT be replaced when fallback is disabled")
+}
+
+func TestSyslogTarget_HostnameFallbackMissingHostname(t *testing.T) {
+	w := log.NewSyncWriter(os.Stderr)
+	logger := log.NewLogfmtLogger(w)
+	client := fake.NewClient(func() {})
+
+	metrics := NewMetrics(nil)
+
+	// Create relabel config that copies __syslog_message_hostname to hostname label
+	relabelCfg := `
+- source_labels: ['__syslog_message_hostname']
+  target_label: 'hostname'
+`
+	var relabels []*relabel.Config
+	err := yaml.Unmarshal([]byte(relabelCfg), &relabels)
+	require.NoError(t, err)
+
+	tgt, err := NewSyslogTarget(metrics, logger, client, relabels, &scrapeconfig.SyslogTargetConfig{
+		ListenAddress:        "127.0.0.1:0",
+		HostnameFallbackToIP: true,
+		Labels: model.LabelSet{
+			"test": "hostname_fallback_missing",
+		},
+	})
+	require.NoError(t, err)
+	defer func() {
+		require.NoError(t, tgt.Stop())
+	}()
+
+	require.Eventually(t, tgt.Ready, time.Second, 10*time.Millisecond)
+
+	addr := tgt.ListenAddress().String()
+	c, err := net.Dial("tcp", addr)
+	require.NoError(t, err)
+
+	// RFC5424 message with nil hostname (using "-" placeholder)
+	messages := []string{
+		`<165>1 2018-10-11T22:14:15.003Z - app - id1 - Message without hostname`,
+	}
+
+	err = writeMessagesToStream(c, messages, fmtOctetCounting)
+	require.NoError(t, err)
+	require.NoError(t, c.Close())
+
+	require.Eventuallyf(t, func() bool {
+		return len(client.Received()) == len(messages)
+	}, time.Second, 10*time.Millisecond, "Expected to receive %d messages, got %d.", len(messages), len(client.Received()))
+
+	// Check that missing hostname was replaced with connection IP (127.0.0.1)
+	hostname := string(client.Received()[0].Labels["hostname"])
+	require.Equal(t, "127.0.0.1", hostname, "missing hostname should be replaced with connection IP")
 }

@@ -8,6 +8,7 @@ import (
 	"errors"
 	"fmt"
 	"net"
+	"regexp"
 	"strings"
 	"time"
 
@@ -30,6 +31,16 @@ var (
 	DefaultIdleTimeout      = 120 * time.Second
 	DefaultMaxMessageLength = 8192
 	DefaultProtocol         = protocolTCP
+
+	// badHostnamePatterns matches hostnames that are likely malformed due to
+	// devices omitting the hostname field in syslog messages. This causes the
+	// parser to incorrectly extract process names, paths, or timezone fragments
+	// as hostnames.
+	badHostnamePatterns = []*regexp.Regexp{
+		regexp.MustCompile(`^/`),              // Paths (e.g., "/usr/sbin/cron[78976]:")
+		regexp.MustCompile(`^\w+\[\d+\]:?$`),  // Process[PID] patterns (e.g., "sshd[78988]:")
+		regexp.MustCompile(`^[A-Z]{2,4}:$`),   // Timezone fragments (e.g., "EST:", "UTC:")
+	}
 )
 
 // SyslogTarget listens to syslog messages.
@@ -51,6 +62,19 @@ type message struct {
 	labels    model.LabelSet
 	message   string
 	timestamp time.Time
+}
+
+// isLikelyBadHostname checks if the hostname appears to be a malformed value
+// that was incorrectly extracted from a syslog message missing a hostname field.
+// Some devices (iDRACs, certain Juniper gear, etc.) omit the hostname, causing
+// the parser to grab process names, paths, or timezone fragments instead.
+func isLikelyBadHostname(hostname string) bool {
+	for _, pattern := range badHostnamePatterns {
+		if pattern.MatchString(hostname) {
+			return true
+		}
+	}
+	return false
 }
 
 // NewSyslogTarget configures a new SyslogTarget.
@@ -126,7 +150,20 @@ func (t *SyslogTarget) handleMessageRFC5424(connLabels labels.Labels, msg syslog
 		lb.Set("__syslog_message_facility", *v)
 	}
 	if v := rfc5424Msg.Hostname; v != nil {
-		lb.Set("__syslog_message_hostname", *v)
+		hostname := *v
+		// If hostname fallback is enabled and the hostname looks malformed,
+		// replace it with the connection source IP address.
+		if t.config.HostnameFallbackToIP && isLikelyBadHostname(hostname) {
+			if ip := connLabels.Get("__syslog_connection_ip_address"); ip != "" {
+				hostname = ip
+			}
+		}
+		lb.Set("__syslog_message_hostname", hostname)
+	} else if t.config.HostnameFallbackToIP {
+		// Hostname is missing entirely - use connection IP as fallback
+		if ip := connLabels.Get("__syslog_connection_ip_address"); ip != "" {
+			lb.Set("__syslog_message_hostname", ip)
+		}
 	}
 	if v := rfc5424Msg.Appname; v != nil {
 		lb.Set("__syslog_message_app_name", *v)
@@ -193,7 +230,20 @@ func (t *SyslogTarget) handleMessageRFC3164(connLabels labels.Labels, msg syslog
 		lb.Set("__syslog_message_facility", *v)
 	}
 	if v := rfc3164Msg.Hostname; v != nil {
-		lb.Set("__syslog_message_hostname", *v)
+		hostname := *v
+		// If hostname fallback is enabled and the hostname looks malformed,
+		// replace it with the connection source IP address.
+		if t.config.HostnameFallbackToIP && isLikelyBadHostname(hostname) {
+			if ip := connLabels.Get("__syslog_connection_ip_address"); ip != "" {
+				hostname = ip
+			}
+		}
+		lb.Set("__syslog_message_hostname", hostname)
+	} else if t.config.HostnameFallbackToIP {
+		// Hostname is missing entirely - use connection IP as fallback
+		if ip := connLabels.Get("__syslog_connection_ip_address"); ip != "" {
+			lb.Set("__syslog_message_hostname", ip)
+		}
 	}
 	if v := rfc3164Msg.Appname; v != nil {
 		lb.Set("__syslog_message_app_name", *v)

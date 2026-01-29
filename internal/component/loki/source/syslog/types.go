@@ -25,6 +25,7 @@ type ListenerConfig struct {
 	TLSConfig                   config.TLSConfig          `alloy:"tls_config,block,optional"`
 	SyslogFormat                config.SysLogFormat       `alloy:"syslog_format,attr,optional"`
 	UseFallbackParser           bool                      `alloy:"use_fallback_parser,attr,optional"`
+	HostnameFallbackToIP        bool                      `alloy:"hostname_fallback_to_ip,attr,optional"`
 }
 
 
@@ -80,6 +81,7 @@ func (sc ListenerConfig) Convert() (*scrapeconfig.SyslogTargetConfig, error) {
 		TLSConfig:                   *sc.TLSConfig.Convert(),
 		SyslogFormat:                syslogFormat,
 		UseFallbackParser:           sc.UseFallbackParser,
+		HostnameFallbackToIP:        sc.HostnameFallbackToIP,
 	}, nil
 }
 

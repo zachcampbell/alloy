@@ -22,7 +22,7 @@ func TestParseFallbackMessage(t *testing.T) {
 			name:           "Cisco with priority and colon",
 			input:          "<189>: 2025 Aug 13 22:08:06 UTC: %ETHPORT-5-IF_ADMIN_UP: Interface Ethernet1/2 is admin up",
 			expectPriority: true,
-			expectHostname: true,
+			expectHostname: false, // Cisco NX-OS format has no hostname field
 			expectAppname:  true,
 			expectMessage:  true,
 		},
@@ -38,8 +38,8 @@ func TestParseFallbackMessage(t *testing.T) {
 			name:           "Message without priority",
 			input:          "2025 Aug 13 22:08:06 UTC: %ETHPORT-5-IF_ADMIN_UP: Interface Ethernet1/2 is admin up",
 			expectPriority: false,
-			expectHostname: true,
-			expectAppname:  true,
+			expectHostname: false, // No hostname in this format
+			expectAppname:  true,  // Facility code is extracted as appname
 			expectMessage:  true,
 		},
 		{
@@ -112,7 +112,7 @@ func TestParseFallbackStream(t *testing.T) {
 	}
 
 	reader := bytes.NewReader([]byte(input))
-	ParseFallbackStream(reader, callback, 8192)
+	ParseFallbackStream(true, reader, callback, 8192)
 
 	if len(results) != 3 {
 		t.Errorf("Expected 3 messages, got %d", len(results))

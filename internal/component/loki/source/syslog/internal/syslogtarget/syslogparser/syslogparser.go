@@ -76,11 +76,19 @@ func ParseStreamWithConfig(isRFC3164Message bool, useRFC3164DefaultYear bool, us
 var (
 	ciscoPattern = regexp.MustCompile(`^<(\d+)>:?\s*(.*)`)
 	rfc5424Pattern = regexp.MustCompile(`^<(\d+)>\s*(\d+)\s+(\S+)\s+(\S+)\s+(.*)`)
-	timestampPattern = regexp.MustCompile(`^\*?(\w{3}\s+\d{1,2}\s+\d{2}:\d{2}:\d{2})(?:\s+\w{3,4})?:\s*(.*)`)
-	facilityPattern = regexp.MustCompile(`^(%[A-Z0-9_]+-\d+-[A-Z0-9_]+):\s*(.*)`)
-	hostnamePattern = regexp.MustCompile(`:\s*(\w+)\s+%[A-Z0-9_]+-\d+-[A-Z0-9_]+:`)
+	// Cisco ASA sometimes emits a year in the timestamp ("Jan 07 2026 16:14:31") while
+	// other devices omit the year ("Jan 07 16:14:31"). Accept an optional year to
+	// keep the fallback parser from failing on those lines.
+	timestampPattern = regexp.MustCompile(`^\*?(\w{3}\s+\d{1,2}(?:\s+\d{4})?\s+\d{2}:\d{2}:\d{2})(?:\s+\w{3,4})?:\s*(.*)`)
+	// Year-first timestamp: "2025 Aug 13 22:08:06 UTC:"
+	yearFirstTimestampPattern = regexp.MustCompile(`^(\d{4}\s+\w{3}\s+\d{1,2}\s+\d{2}:\d{2}:\d{2})(?:\s+\w{3,4})?:\s*(.*)`)
+	// ISO8601 timestamp followed by hostname: "2025-08-13T22:39:54.83Z hostname"
+	iso8601HostnamePattern = regexp.MustCompile(`^(\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d+)?Z?)\s+([^\s]+)\s+(.*)`)
+	facilityPattern        = regexp.MustCompile(`^(%[A-Z0-9_]+-\d+-[A-Z0-9_]+):\s*(.*)`)
+	hostnamePattern        = regexp.MustCompile(`:\s*(\w+)\s+%[A-Z0-9_]+-\d+-[A-Z0-9_]+:`)
 	fortinetPattern = regexp.MustCompile(`^(?:<(\d+)>)?date=(\d{4}-\d{2}-\d{2})\s+time=(\d{2}:\d{2}:\d{2})\s+devname="([^"]+)"\s+(.*)`)
 	juniperPattern = regexp.MustCompile(`^<(\d+)>(\w{3}\s+\d{1,2}\s+\d{2}:\d{2}:\d{2})\s+([^\s]+)\s+(.*)$`)
+	bsdHostAppPattern = regexp.MustCompile(`^(\w{3}\s+\d{1,2}\s+\d{2}:\d{2}:\d{2})\s+([^\s]+)\s+([^\s:]+)(?:\[\d+\])?:\s*(.*)`)
 	facilityNames = []string{
 		"kern", "user", "mail", "daemon", "auth", "syslog", "lpr", "news",
 		"uucp", "cron", "authpriv", "ftp", "ntp", "security", "console", "solaris-cron",
@@ -88,6 +96,21 @@ var (
 	}
 	severityNames = []string{
 		"emerg", "alert", "crit", "err", "warning", "notice", "info", "debug",
+	}
+	ciscoTimestampLayouts = []string{
+		"Jan 02 15:04:05",
+		"Jan _2 15:04:05",
+		"Jan 02 15:04:05 MST",
+		"Jan _2 15:04:05 MST",
+		"Jan 02 2006 15:04:05",
+		"Jan _2 2006 15:04:05",
+		"Jan 02 2006 15:04:05 MST",
+		"Jan _2 2006 15:04:05 MST",
+		// Year-first formats (Cisco NX-OS style)
+		"2006 Jan 02 15:04:05",
+		"2006 Jan _2 15:04:05",
+		"2006 Jan 02 15:04:05 MST",
+		"2006 Jan _2 15:04:05 MST",
 	}
 )
 
@@ -135,6 +158,7 @@ func parseFallbackMessage(line []byte) *FallbackMessage {
 	msg := &FallbackMessage{}
 	text := string(line)
 	originalText := text
+	timestampParsed := false
 	
 	// Check if this is Fortinet format: <pri>date=YYYY-MM-DD time=HH:MM:SS devname="..." ...
 	if matches := fortinetPattern.FindStringSubmatch(text); len(matches) > 5 {
@@ -264,7 +288,6 @@ func parseFallbackMessage(line []byte) *FallbackMessage {
 	
 	// Original Cisco format parsing
 	// Extract priority
-	priorityParsed := false
 	if matches := ciscoPattern.FindStringSubmatch(text); len(matches) > 2 {
 		if pri, err := strconv.Atoi(matches[1]); err == nil && pri >= 0 && pri <= 191 {
 			priority := uint8(pri)
@@ -274,37 +297,70 @@ func parseFallbackMessage(line []byte) *FallbackMessage {
 			msg.Facility = &facility
 			msg.Severity = &severity
 			text = matches[2]
-			priorityParsed = true
 		}
 	}
-	
-	// Try to parse Cisco timestamp format: "Aug 13 22:08:06" with optional timezone
-	timestampParsed := false
-	if matches := timestampPattern.FindStringSubmatch(text); len(matches) > 2 {
-		// Try parsing without timezone first (FS switches format)
-		if t, err := time.Parse("Jan 02 15:04:05", matches[1]); err == nil {
-			// Set year to current year since Cisco doesn't include it
-			now := time.Now()
-			t = t.AddDate(now.Year()-t.Year(), 0, 0)
-			msg.Timestamp = &t
-			timestampParsed = true
-		} else if t, err := time.Parse("Jan 02 15:04:05 MST", matches[1]); err == nil {
-			// Try with timezone for other formats
-			now := time.Now()
-			t = t.AddDate(now.Year()-t.Year(), 0, 0)
-			msg.Timestamp = &t
+
+	// Try BSD-like host/app pattern: "Nov  4 02:54:44 host app[pid]: message"
+	if matches := bsdHostAppPattern.FindStringSubmatch(text); len(matches) > 4 {
+		if t, ok := parseTimestampWithLayouts(matches[1], ciscoTimestampLayouts); ok {
+			msg.Timestamp = t
 			timestampParsed = true
 		}
-		text = matches[2]
+		hostname := matches[2]
+		msg.Hostname = &hostname
+		appname := matches[3]
+		msg.Appname = &appname
+		message := matches[4]
+		msg.Message = &message
+		text = matches[4]
 	}
 	
+	// Try to parse Cisco timestamp format: "Aug 13 22:08:06" or "Jan 07 2026 16:14:31" with optional timezone
+	if !timestampParsed {
+		if matches := timestampPattern.FindStringSubmatch(text); len(matches) > 2 {
+			if t, ok := parseTimestampWithLayouts(matches[1], ciscoTimestampLayouts); ok {
+				msg.Timestamp = t
+				timestampParsed = true
+			}
+			text = matches[2]
+		}
+	}
+
+	// Try year-first timestamp: "2025 Aug 13 22:08:06 UTC:"
+	if !timestampParsed {
+		if matches := yearFirstTimestampPattern.FindStringSubmatch(text); len(matches) > 2 {
+			if t, ok := parseTimestampWithLayouts(matches[1], ciscoTimestampLayouts); ok {
+				msg.Timestamp = t
+				timestampParsed = true
+			}
+			text = matches[2]
+		}
+	}
+
+	// Try ISO8601 timestamp with hostname: "2025-08-13T22:39:54.83Z hostname message"
+	if !timestampParsed {
+		if matches := iso8601HostnamePattern.FindStringSubmatch(text); len(matches) > 3 {
+			if t, err := time.Parse(time.RFC3339Nano, matches[1]); err == nil {
+				msg.Timestamp = &t
+				timestampParsed = true
+			} else if t, err := time.Parse("2006-01-02T15:04:05.999Z", matches[1]); err == nil {
+				msg.Timestamp = &t
+				timestampParsed = true
+			} else if t, err := time.Parse("2006-01-02T15:04:05", matches[1]); err == nil {
+				msg.Timestamp = &t
+				timestampParsed = true
+			}
+			hostname := matches[2]
+			msg.Hostname = &hostname
+			text = matches[3]
+		}
+	}
+
 	// Try to parse Cisco facility: %FACILITY-SEVERITY-MNEMONIC:
-	facilityParsed := false
 	if matches := facilityPattern.FindStringSubmatch(text); len(matches) > 2 {
 		msg.Appname = &matches[1]
 		message := matches[2]
 		msg.Message = &message
-		facilityParsed = true
 	} else {
 		// No facility found, entire text is the message
 		msg.Message = &text
@@ -389,4 +445,16 @@ func ParseFallbackStream(isRFC3164Message bool, r io.Reader, callback func(res *
 			Error:   err,
 		})
 	}
+}
+
+// parseTimestampWithLayouts tries a set of layouts and normalizes year-less timestamps to the current year.
+func parseTimestampWithLayouts(ts string, layouts []string) (*time.Time, bool) {
+	for _, layout := range layouts {
+		if t, err := time.Parse(layout, ts); err == nil {
+			now := time.Now()
+			t = t.AddDate(now.Year()-t.Year(), 0, 0)
+			return &t, true
+		}
+	}
+	return nil, false
 }

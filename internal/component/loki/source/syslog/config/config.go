@@ -61,6 +61,11 @@ type SyslogTargetConfig struct {
 	// (e.g., Cisco format). When enabled, messages that don't match RFC5424
 	// or RFC3164 will be parsed using a best-effort fallback parser.
 	UseFallbackParser bool `yaml:"use_fallback_parser"`
+
+	// HostnameFallbackToIP enables automatic detection of malformed or missing
+	// hostnames (e.g., process[pid]: patterns from devices that omit the hostname
+	// field) and replaces them with the connection source IP address.
+	HostnameFallbackToIP bool `yaml:"hostname_fallback_to_ip"`
 }
 
 func (config SyslogTargetConfig) IsRFC3164Message() bool {
